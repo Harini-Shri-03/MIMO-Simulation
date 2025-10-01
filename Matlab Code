@@ -1,0 +1,173 @@
+clear; close all; rng('default');
+
+%% PARAMETERS
+SNRdB = 0:2:20;               % SNR range (dB)
+nSymTotal = 20000;            % total symbols per SNR (per stream). Lower to test faster.
+blockSize = 1000;             % inner block (for progress)
+nBlocks = ceil(nSymTotal / blockSize);
+
+M = 4;                        % QPSK
+const = [(1+1j), (-1+1j), (-1-1j), (1-1j)]/sqrt(2);  % QPSK constellation
+
+%% === 1) Spatial Multiplexing: 2x2 and 4x4 (ZF and MMSE) ===
+Nt_list = [2 4];
+Nr_list = [2 4];  % choose matching Nr for clarity
+
+BER_ZF = zeros(length(Nt_list), length(SNRdB));
+BER_MMSE = zeros(size(BER_ZF));
+
+for iNt = 1:length(Nt_list)
+  Nt = Nt_list(iNt); Nr = Nr_list(iNt);
+  fprintf('--- Spatial multiplexing %dx%d ---\n', Nt, Nr);
+  for iS = 1:length(SNRdB)
+    SNR = 10^(SNRdB(iS)/10);
+    sigma2 = 1 / SNR;    % noise variance per complex symbol (with Es normalized to 1)
+    nErrZF = 0; nErrMMSE = 0; nSym = 0;
+
+    for b = 1:nBlocks
+      thisBlock = min(blockSize, nSymTotal - (b-1)*blockSize);
+      for k = 1:thisBlock
+        % Random QPSK symbols for Nt streams
+        symIdx = randi(M,[Nt,1]);
+        s = const(symIdx).';    % Nt x 1 (ensure column)
+
+        % Rayleigh channel: Nr x Nt
+        H = (randn(Nr,Nt) + 1j*randn(Nr,Nt))/sqrt(2);
+
+        % Transmit (power normalized total)
+        x = sqrt(1/Nt) * s;    % Nt x 1
+
+        % AWGN
+        noise = sqrt(sigma2/2) * (randn(Nr,1) + 1j*randn(Nr,1));
+
+        % Receive
+        y = H * x + noise;
+
+        % ZF detection
+        s_zf = pinv(H) * y;    % Nt x 1
+        estZF = nearest_const(s_zf, const);
+        nErrZF = nErrZF + sum(estZF ~= symIdx);
+
+        % MMSE detection
+        W = (H' * H + sigma2 * eye(Nt)) \ H';
+        s_mmse = W * y;
+        estMMSE = nearest_const(s_mmse, const);
+        nErrMMSE = nErrMMSE + sum(estMMSE ~= symIdx);
+
+        nSym = nSym + Nt;
+      end
+    end
+
+    BER_ZF(iNt,iS) = nErrZF / nSym;
+    BER_MMSE(iNt,iS) = nErrMMSE / nSym;
+    fprintf('Nt=%d SNR=%2d dB: ZF=%.3e  MMSE=%.3e\n', Nt, SNRdB(iS), BER_ZF(iNt,iS), BER_MMSE(iNt,iS));
+  end
+end
+
+figure; semilogy(SNRdB, BER_ZF(1,:), '-o','LineWidth',1.2); hold on;
+semilogy(SNRdB, BER_MMSE(1,:), '-s','LineWidth',1.2);
+semilogy(SNRdB, BER_ZF(2,:), '--o','LineWidth',1.2);
+semilogy(SNRdB, BER_MMSE(2,:), '--s','LineWidth',1.2);
+grid on; xlabel('SNR (dB)'); ylabel('BER'); legend('2x2 ZF','2x2 MMSE','4x4 ZF','4x4 MMSE','Location','southwest');
+title('Spatial Multiplexing: ZF vs MMSE');
+
+%% === 2) Alamouti (2x1 / 2x2 receive combining) ===
+NrAl = 2;                % choose 1 or 2 (we simulate 2 here)
+nPairsTotal = 10000;
+blockPairs = 1000;
+nBlockPairs = ceil(nPairsTotal / blockPairs);
+
+BER_Alamouti = zeros(1,length(SNRdB));
+fprintf('\n--- Alamouti 2x%d ---\n', NrAl);
+for iS = 1:length(SNRdB)
+  SNR = 10^(SNRdB(iS)/10);
+  sigma2 = 1 / SNR;
+  nErr = 0; nSymTotalPairs = 0;
+
+  for b = 1:nBlockPairs
+    thisBlock = min(blockPairs, nPairsTotal - (b-1)*blockPairs);
+    for k = 1:thisBlock
+      % two symbols in a pair
+      symIdx = randi(M, [2,1]);
+      s_pair = const(symIdx);   % 1x2
+
+      % Channel: Nr x 2 (h_{i,1}, h_{i,2} per rx antenna)
+      H = (randn(NrAl,2) + 1j*randn(NrAl,2))/sqrt(2);
+
+      % Time-slot 1: tx1 s1, tx2 s2
+      noise1 = sqrt(sigma2/2) * (randn(NrAl,1) + 1j*randn(NrAl,1));
+      r1 = H(:,1)*s_pair(1) + H(:,2)*s_pair(2) + noise1;
+
+      % Time-slot 2: tx1 -conj(s2), tx2 conj(s1)
+      noise2 = sqrt(sigma2/2) * (randn(NrAl,1) + 1j*randn(NrAl,1));
+      r2 = H(:,1)*(-conj(s_pair(2))) + H(:,2)*conj(s_pair(1)) + noise2;
+
+      % Combine across receive antennas (MRC across Rx)
+      s1_acc = 0; s2_acc = 0; denom = 0;
+      for rx = 1:NrAl
+        h1 = H(rx,1); h2 = H(rx,2);
+        s1_acc = s1_acc + conj(h1)*r1(rx) + h2*conj(r2(rx));
+        s2_acc = s2_acc + conj(h2)*r1(rx) - h1*conj(r2(rx));
+        denom = denom + (abs(h1)^2 + abs(h2)^2);
+      end
+      s1_hat = s1_acc / denom;
+      s2_hat = s2_acc / denom;
+
+      est1 = nearest_const(s1_hat, const);
+      est2 = nearest_const(s2_hat, const);
+
+      nErr = nErr + (est1 ~= symIdx(1)) + (est2 ~= symIdx(2));
+      nSymTotalPairs = nSymTotalPairs + 2;
+    end
+  end
+
+  BER_Alamouti(iS) = nErr / nSymTotalPairs;
+  fprintf('SNR=%2d dB Alamouti BER=%.3e\n', SNRdB(iS), BER_Alamouti(iS));
+end
+
+figure; semilogy(SNRdB, BER_Alamouti, '-o','LineWidth',1.2); grid on;
+xlabel('SNR (dB)'); ylabel('BER'); title(sprintf('Alamouti 2x%d (QPSK)', NrAl));
+
+%% === 3) Tx-repetition diversity for 4x4 (transmit same symbol on 4 tx, MRC combiner) ===
+NtRep = 4; NrRep = 4;
+BER_Rep = zeros(1,length(SNRdB));
+fprintf('\n--- Tx repetition 4x4 ---\n');
+for iS = 1:length(SNRdB)
+  SNR = 10^(SNRdB(iS)/10);
+  sigma2 = 1 / SNR;
+  nErr = 0; nSym = 0;
+  for b = 1:nBlocks
+    thisBlock = min(blockSize, nSymTotal - (b-1)*blockSize);
+    for k = 1:thisBlock
+      symIdx = randi(M,1,1);
+      s = const(symIdx);
+      H = (randn(NrRep,NtRep) + 1j*randn(NrRep,NtRep))/sqrt(2);
+      txVec = s * ones(NtRep,1) / sqrt(NtRep);   % power normalized
+      noise = sqrt(sigma2/2) * (randn(NrRep,1) + 1j*randn(NrRep,1));
+      y = H * txVec + noise;
+
+      h_eff = H * ones(NtRep,1) / sqrt(NtRep);   % effective Nr x 1
+      s_hat = (conj(h_eff).' * y) / (h_eff' * h_eff);  % scalar
+      est = nearest_const(s_hat, const);
+      nErr = nErr + (est ~= symIdx);
+      nSym = nSym + 1;
+    end
+  end
+  BER_Rep(iS) = nErr / nSym;
+  fprintf('SNR=%2d dB Rep4x4 BER=%.3e\n', SNRdB(iS), BER_Rep(iS));
+end
+
+figure; semilogy(SNRdB, BER_Rep, '-s','LineWidth',1.2); grid on;
+xlabel('SNR (dB)'); ylabel('BER'); title('Tx repetition 4x4 (QPSK)');
+
+%% helper: nearest_const
+function idx = nearest_const(s_est, const)
+  % Find nearest constellation point(s)
+  s_est = s_est(:);  % column vector (N x 1)
+  N = numel(s_est);
+  idx = zeros(N,1);
+  for ii = 1:N
+    [~,ind] = min(abs(s_est(ii) - const));
+    idx(ii) = ind;
+  end
+end
